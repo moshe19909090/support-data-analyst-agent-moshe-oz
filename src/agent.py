@@ -9,6 +9,10 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from src.llm import get_llm
 from src.router import route_query
 from src.tools import build_tools
+from src.profile_memory import (
+    format_user_profile,
+    update_user_profile_from_turn,
+)
 
 
 MAX_ITERATIONS = 12
@@ -25,17 +29,21 @@ class AgentResult(TypedDict):
 SYSTEM_PROMPT = """
 You are a customer support dataset analyst.
 
-You must answer questions ONLY using the available dataset tools.
+You must answer questions ONLY using the available dataset tools, conversation memory,
+or the persisted user profile.
 Do not answer from general knowledge.
 
 The dataset contains customer requests, agent responses, categories, and intents.
 
 Critical behavior rules:
 - For every structured or unstructured dataset question, you MUST call at least one tool before answering.
-- For memory questions, answer from the previous conversation history and do not require dataset tools.- Do NOT describe which tool you would call.
+- For memory questions, answer from the previous conversation history and/or the user profile.
+- For user-profile questions such as "What do you remember about me?", answer from the provided profile context.
+- Do NOT describe which tool you would call.
 - Do NOT say "this function call will..." or "I would use...".
 - Actually call the relevant tool, inspect the result, and then answer.
 - Never invent dataset facts that were not returned by tools.
+- Never invent user facts that are not present in the profile or conversation history.
 - If the query type is out_of_scope, do not answer it.
 - Tool arguments must be plain JSON values only: strings, numbers, booleans, lists, or null.
 - Never pass another tool call, function name, or nested object as an argument to a tool.
@@ -119,49 +127,67 @@ def _print_reasoning_step(message: Any) -> None:
         print(_shorten(message.content))
 
 
+def _build_user_instruction(
+    query: str,
+    query_type: str,
+    router_reason: str,
+    profile_context: str,
+) -> str:
+    if query_type == "memory":
+        return (
+            f"Query type: {query_type}\n"
+            f"Router reason: {router_reason}\n"
+            f"User question: {query}\n\n"
+            f"Persisted user profile:\n{profile_context}\n\n"
+            "Answer using the previous conversation history in this same session and the persisted user profile. "
+            "Do NOT call dataset tools unless the user asks a new dataset question. "
+            "If the user provides a profile fact such as their name or preference, acknowledge it briefly. "
+            "If the user asks what you remember about them, answer only from the persisted profile and conversation history. "
+            "Do not invent facts."
+        )
+
+    return (
+        f"Query type: {query_type}\n"
+        f"Router reason: {router_reason}\n"
+        f"User question: {query}\n\n"
+        f"Persisted user profile:\n{profile_context}\n\n"
+        "You MUST use at least one dataset tool before answering. "
+        "Do not merely describe a tool call. Actually call the tool. "
+        "After receiving the tool observation, answer only from the returned dataset evidence.\n\n"
+        "If this is a follow-up question, use the previous messages in this session "
+        "to understand what the user is referring to, then call the appropriate tools.\n\n"
+        "If the question asks for examples, call an example/filter/search tool. "
+        "If the question asks for a count, call a filtering tool and then a count/distribution tool. "
+        "If the question asks for a summary, first retrieve representative rows, then summarize those rows. "
+        "Do not answer from general knowledge."
+    )
+
+
 def run_agent(query: str, session_id: str = "default") -> AgentResult:
     route_decision = route_query(query)
+    update_user_profile_from_turn(session_id, query)
     query_type = route_decision.route
 
     if query_type == "out_of_scope":
+        final_answer = (
+            "Sorry, this question is outside the scope of the customer support dataset. "
+            "I can only answer questions about the dataset's categories, intents, examples, responses, "
+            "or about the current saved conversation session."
+        )
         return {
             "query_type": query_type,
-            "final_answer": (
-                "Sorry, this question is outside the scope of the customer support dataset. "
-                "I can only answer questions about the dataset's categories, intents, examples, responses, "
-                "or about the current saved conversation session."
-            ),
+            "final_answer": final_answer,
         }
 
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
-    if query_type == "memory":
-        user_instruction = (
-            f"Query type: {query_type}\n"
-            f"Router reason: {route_decision.reason}\n"
-            f"User question: {query}\n\n"
-            "Answer using the previous conversation history in this same session. "
-            "Do NOT call dataset tools unless the user asks a new dataset question. "
-            "If the user asks what was discussed, summarize the main topics from this session. "
-            "If the user asks what you remember about them, answer only from information available "
-            "in the persisted conversation history. "
-            "Do not invent facts."
-        )
-    else:
-        user_instruction = (
-            f"Query type: {query_type}\n"
-            f"Router reason: {route_decision.reason}\n"
-            f"User question: {query}\n\n"
-            "You MUST use at least one dataset tool before answering. "
-            "Do not merely describe a tool call. Actually call the tool. "
-            "After receiving the tool observation, answer only from the returned dataset evidence.\n\n"
-            "If this is a follow-up question, use the previous messages in this session "
-            "to understand what the user is referring to, then call the appropriate tools.\n\n"
-            "If the question asks for examples, call an example/filter/search tool. "
-            "If the question asks for a count, call a filtering tool and then a count/distribution tool. "
-            "If the question asks for a summary, first retrieve representative rows, then summarize those rows. "
-            "Do not answer from general knowledge."
-        )
+    profile_context = format_user_profile(session_id=session_id)
+    user_instruction = _build_user_instruction(
+        query=query,
+        query_type=query_type,
+        router_reason=route_decision.reason,
+        profile_context=profile_context,
+    )
 
     messages = [HumanMessage(content=user_instruction)]
 
@@ -205,10 +231,11 @@ def run_agent(query: str, session_id: str = "default") -> AgentResult:
         }
 
     except (GraphRecursionError, RecursionError):
+        final_answer = (
+            "I reached the maximum number of reasoning steps before producing a final answer. "
+            "Please try asking a narrower question."
+        )
         return {
             "query_type": query_type,
-            "final_answer": (
-                "I reached the maximum number of reasoning steps before producing a final answer. "
-                "Please try asking a narrower question."
-            ),
+            "final_answer": final_answer,
         }

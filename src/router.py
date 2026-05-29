@@ -54,9 +54,14 @@ Examples:
 
 memory:
 Use this when the user asks about the current conversation, previous turns,
-session history, or what the assistant remembers about the user.
+session history, what the assistant remembers about the user, or when the user shares
+stable profile information such as their name, preferences, or recurring interests.
 
 Examples:
+- My name is Moshe.
+- Call me Moshe.
+- I prefer concise answers.
+- I like working step by step.
 - What did we discuss in this session?
 - What do you remember about me?
 - What was my previous question?
@@ -67,7 +72,7 @@ Examples:
 out_of_scope:
 Use this when the user asks for general knowledge, recommendations, poems, advice,
 software recommendations, current events, or anything not answerable from the dataset
-or conversation memory.
+or conversation/profile memory.
 
 Important:
 - Questions about "best CRM software", "president", "Champions League", poems,
@@ -76,7 +81,8 @@ Important:
   It must ask about the dataset itself.
 - Follow-up dataset questions like "show me 3 more", "what about refunds?", or
   "what is the total count of the last two?" are structured because they require dataset work plus conversation history.
-- Questions about the conversation itself are memory, not out_of_scope.
+- Questions about the conversation itself or the persistent user profile are memory, not out_of_scope.
+- Explicit user profile statements like "my name is...", "call me...", "I prefer...", or "I like..." are memory.
 
 Return ONLY valid JSON in this exact format:
 {
@@ -105,7 +111,17 @@ def route_query(query: str) -> RouteDecision:
 
 
 def fallback_route(query: str) -> RouteDecision:
-    lowered = query.lower()
+    lowered = query.lower().strip()
+
+    profile_statement_keywords = [
+        "my name is",
+        "call me",
+        "i am ",
+        "i'm ",
+        "i prefer",
+        "i like",
+        "i want",
+    ]
 
     memory_keywords = [
         "what did we discuss",
@@ -115,7 +131,6 @@ def fallback_route(query: str) -> RouteDecision:
         "earlier",
         "this session",
         "conversation",
-        "last two",
         "last question",
         "what did i ask",
         "remind me",
@@ -146,6 +161,7 @@ def fallback_route(query: str) -> RouteDecision:
         "what about",
         "more",
         "total count",
+        "last two",
     ]
 
     unstructured_keywords = [
@@ -161,10 +177,16 @@ def fallback_route(query: str) -> RouteDecision:
         "complaint",
     ]
 
+    if any(keyword in lowered for keyword in profile_statement_keywords):
+        return RouteDecision(
+            route="memory",
+            reason="The query shares stable user profile information that should be remembered.",
+        )
+
     if any(keyword in lowered for keyword in memory_keywords):
         return RouteDecision(
             route="memory",
-            reason="The query asks about the current conversation or remembered session context.",
+            reason="The query asks about the current conversation or remembered session/profile context.",
         )
 
     if any(keyword in lowered for keyword in out_of_scope_keywords):
@@ -187,5 +209,5 @@ def fallback_route(query: str) -> RouteDecision:
 
     return RouteDecision(
         route="out_of_scope",
-        reason="The query could not be clearly answered from the customer support dataset or conversation memory.",
+        reason="The query could not be clearly answered from the customer support dataset or conversation/profile memory.",
     )

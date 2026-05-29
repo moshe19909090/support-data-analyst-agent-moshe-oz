@@ -84,8 +84,8 @@ The MCP server exposes at least these tools:
 
 ## Requirements
 
-- Python 3.10+ for the full project and MCP server.
-- Python 3.12 is recommended for MCP / FastMCP.
+- Python 3.12 is recommended for the full project, including the CLI agent and FastMCP server.
+- Python 3.10+ is required by FastMCP, but the project was tested end-to-end with Python 3.12.
 - Network access is needed on the first run to download the Bitext dataset from Hugging Face.
 - An OpenAI-compatible API key is required for the LangGraph agent.
 
@@ -103,11 +103,13 @@ cd support-data-analyst-agent-moshe-oz
 Create and activate a virtual environment:
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+The same `.venv` environment is used for both the interactive LangGraph CLI agent and the FastMCP server.
 
 Create a `.env` file in the project root.
 
@@ -240,22 +242,21 @@ The dataset tools in `src/tools.py` are also exposed as an MCP server named **su
 
 The server reuses existing tool functions directly. It does not duplicate dataset logic and does not call the LangGraph agent.
 
-### MCP setup with Python 3.12
+### MCP setup
 
-FastMCP requires Python 3.10+. Python 3.12 is recommended.
+FastMCP requires Python 3.10+. This project was tested end-to-end with Python 3.12 using the same `.venv` environment created in the setup section.
 
-If using Homebrew on macOS:
+If using Homebrew on macOS and Python 3.12 is not installed yet:
 
 ```bash
 brew install python@3.12
 ```
 
-Create a dedicated MCP environment:
+Then use the existing project environment:
 
 ```bash
-python3.12 -m venv .venv-mcp
-source .venv-mcp/bin/activate
-pip install --upgrade pip
+source .venv/bin/activate
+python --version
 pip install -r requirements.txt
 ```
 
@@ -274,7 +275,7 @@ The server uses stdio transport by default. In stdio mode, the process may appea
 In another terminal, or after stopping the server, run:
 
 ```bash
-source .venv-mcp/bin/activate
+source .venv/bin/activate
 python examples/mcp_client_example.py
 ```
 
@@ -330,7 +331,7 @@ Example stdio config:
 }
 ```
 
-Replace `cwd` with your local clone path. Use the Python executable from `.venv-mcp` if your MCP client does not automatically use the project environment.
+Replace `cwd` with your local clone path. If your MCP client does not automatically use the project environment, set `command` to the full path of the Python executable inside `.venv/bin/python`.
 
 ---
 
@@ -357,7 +358,7 @@ Who is the president of France?
 Then verify MCP:
 
 ```bash
-source .venv-mcp/bin/activate
+source .venv/bin/activate
 python examples/mcp_client_example.py
 ```
 
@@ -368,7 +369,6 @@ python examples/mcp_client_example.py
 - The dataset is loaded from Hugging Face on demand.
 - Local runtime files are ignored by Git:
   - `.venv/`
-  - `.venv-mcp/`
   - `.env`
   - `memory/`
   - `__pycache__/`

@@ -1,7 +1,9 @@
+from pathlib import Path
 from typing import Any, TypedDict
 
 from langgraph.prebuilt import create_react_agent
 from langgraph.errors import GraphRecursionError
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 from src.llm import get_llm
@@ -10,6 +12,9 @@ from src.tools import build_tools
 
 
 MAX_ITERATIONS = 12
+
+MEMORY_DIR = Path("memory")
+CHECKPOINT_DB_PATH = MEMORY_DIR / "checkpoints.sqlite"
 
 
 class AgentResult(TypedDict):
@@ -27,7 +32,7 @@ The dataset contains customer requests, agent responses, categories, and intents
 
 Critical behavior rules:
 - For every structured or unstructured dataset question, you MUST call at least one tool before answering.
-- Do NOT describe which tool you would call.
+- For memory questions, answer from the previous conversation history and do not require dataset tools.- Do NOT describe which tool you would call.
 - Do NOT say "this function call will..." or "I would use...".
 - Actually call the relevant tool, inspect the result, and then answer.
 - Never invent dataset facts that were not returned by tools.
@@ -39,6 +44,15 @@ Critical behavior rules:
 - For example, do NOT call count_rows(intent={"function_name": "..."}).
 - Correct flow: call find_intents_by_keyword(keyword="refund"), observe the matching intents,
   then call count_rows(intent="get_refund").
+
+Conversation memory rules:
+- You can use previous conversation turns in the same session to understand follow-up questions.
+- If the user asks "show me more", "show me 3 more", "what about refunds?", or "what is the total count of the last two?",
+  resolve the reference from previous turns in the same session.
+- Even when using conversation memory, you must still call dataset tools before answering dataset questions.
+- For "more examples" follow-ups, continue the same category or intent from the previous example request.
+- For "what about X?" follow-ups, reuse the previous question shape but replace the topic with X.
+- For "total count of the last two", use the previous two count answers from the conversation if they are available.
 
 Structured query rules:
 - For category questions, use the category/listing tools.
@@ -63,7 +77,7 @@ Final answer style:
 """
 
 
-def build_agent():
+def build_agent(checkpointer: SqliteSaver):
     llm = get_llm(temperature=0.0)
     tools = build_tools()
 
@@ -71,6 +85,7 @@ def build_agent():
         model=llm,
         tools=tools,
         prompt=SYSTEM_PROMPT,
+        checkpointer=checkpointer,
     )
 
 
@@ -104,7 +119,7 @@ def _print_reasoning_step(message: Any) -> None:
         print(_shorten(message.content))
 
 
-def run_agent(query: str) -> AgentResult:
+def run_agent(query: str, session_id: str = "default") -> AgentResult:
     route_decision = route_query(query)
     query_type = route_decision.route
 
@@ -113,51 +128,75 @@ def run_agent(query: str) -> AgentResult:
             "query_type": query_type,
             "final_answer": (
                 "Sorry, this question is outside the scope of the customer support dataset. "
-                "I can only answer questions about the dataset's categories, intents, examples, and responses."
+                "I can only answer questions about the dataset's categories, intents, examples, responses, "
+                "or about the current saved conversation session."
             ),
         }
 
-    agent = build_agent()
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
-    messages = [
-        HumanMessage(
-            content=(
-                f"Query type: {query_type}\n"
-                f"Router reason: {route_decision.reason}\n"
-                f"User question: {query}\n\n"
-                "You MUST use at least one dataset tool before answering. "
-                "Do not merely describe a tool call. Actually call the tool. "
-                "After receiving the tool observation, answer only from the returned dataset evidence.\n\n"
-                "If the question asks for examples, call an example/filter/search tool. "
-                "If the question asks for a count, call a filtering tool and then a count/distribution tool. "
-                "If the question asks for a summary, first retrieve representative rows, then summarize those rows. "
-                "Do not answer from general knowledge."
-            )
+    if query_type == "memory":
+        user_instruction = (
+            f"Query type: {query_type}\n"
+            f"Router reason: {route_decision.reason}\n"
+            f"User question: {query}\n\n"
+            "Answer using the previous conversation history in this same session. "
+            "Do NOT call dataset tools unless the user asks a new dataset question. "
+            "If the user asks what was discussed, summarize the main topics from this session. "
+            "If the user asks what you remember about them, answer only from information available "
+            "in the persisted conversation history. "
+            "Do not invent facts."
         )
-    ]
+    else:
+        user_instruction = (
+            f"Query type: {query_type}\n"
+            f"Router reason: {route_decision.reason}\n"
+            f"User question: {query}\n\n"
+            "You MUST use at least one dataset tool before answering. "
+            "Do not merely describe a tool call. Actually call the tool. "
+            "After receiving the tool observation, answer only from the returned dataset evidence.\n\n"
+            "If this is a follow-up question, use the previous messages in this session "
+            "to understand what the user is referring to, then call the appropriate tools.\n\n"
+            "If the question asks for examples, call an example/filter/search tool. "
+            "If the question asks for a count, call a filtering tool and then a count/distribution tool. "
+            "If the question asks for a summary, first retrieve representative rows, then summarize those rows. "
+            "Do not answer from general knowledge."
+        )
+
+    messages = [HumanMessage(content=user_instruction)]
+
+    config = {
+        "recursion_limit": MAX_ITERATIONS,
+        "configurable": {
+            "thread_id": session_id,
+        },
+    }
 
     final_answer = ""
 
     try:
-        for chunk in agent.stream(
-            {"messages": messages},
-            config={"recursion_limit": MAX_ITERATIONS},
-            stream_mode="values",
-        ):
-            current_messages = chunk.get("messages", [])
-            if not current_messages:
-                continue
+        with SqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH)) as checkpointer:
+            agent = build_agent(checkpointer)
 
-            latest_message = current_messages[-1]
-            _print_reasoning_step(latest_message)
+            for chunk in agent.stream(
+                {"messages": messages},
+                config=config,
+                stream_mode="values",
+            ):
+                current_messages = chunk.get("messages", [])
+                if not current_messages:
+                    continue
 
-            if isinstance(latest_message, AIMessage) and latest_message.content:
-                final_answer = latest_message.content
+                latest_message = current_messages[-1]
+                _print_reasoning_step(latest_message)
+
+                if isinstance(latest_message, AIMessage) and latest_message.content:
+                    final_answer = latest_message.content
 
         if not final_answer:
             final_answer = (
-                "I could not produce a final answer from the dataset. "
-                "Please try asking a more specific dataset question."
+                "I could not produce a final answer. "
+                "Please try asking a more specific question."
             )
 
         return {
@@ -170,6 +209,6 @@ def run_agent(query: str) -> AgentResult:
             "query_type": query_type,
             "final_answer": (
                 "I reached the maximum number of reasoning steps before producing a final answer. "
-                "Please try asking a narrower question about the dataset."
+                "Please try asking a narrower question."
             ),
         }
